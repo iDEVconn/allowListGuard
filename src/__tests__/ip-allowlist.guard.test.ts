@@ -165,4 +165,85 @@ describe("IpAllowlistGuard", () => {
   it("fails at construction on a malformed list", () => {
     expect(() => make({ protected: "nope" })).toThrow(/protected/);
   });
+
+  describe("deny (denylist)", () => {
+    it("blocks listed IPs/CIDRs on every route and lets everyone else through (deny alone)", () => {
+      const g = make({ deny: "203.0.113.5, 198.51.100.0/24, 2001:db8::/32" });
+      for (const cls of [ProtectedController, PublicController]) {
+        expect(() => g.canActivate(ctx(cls, "203.0.113.5"))).toThrow(ForbiddenException);
+        expect(() => g.canActivate(ctx(cls, "198.51.100.77"))).toThrow(ForbiddenException);
+        expect(() => g.canActivate(ctx(cls, "2001:db8::1"))).toThrow(ForbiddenException);
+        expect(g.canActivate(ctx(cls, "8.8.8.8"))).toBe(true);
+      }
+    });
+
+    it("matches IPv4-mapped IPv6 and accepts an array", () => {
+      const g = make({ deny: ["203.0.113.5"] });
+      expect(() => g.canActivate(ctx(ProtectedController, "::ffff:203.0.113.5"))).toThrow(
+        ForbiddenException,
+      );
+    });
+
+    it("beats the allowlists: an IP on both lists is rejected", () => {
+      const g = make({ protected: "203.0.113.0/24", deny: "203.0.113.5" });
+      expect(() => g.canActivate(ctx(ProtectedController, "203.0.113.5"))).toThrow(
+        ForbiddenException,
+      );
+      expect(g.canActivate(ctx(ProtectedController, "203.0.113.6"))).toBe(true);
+      // not denied but not allowed either -> allowlist still applies
+      expect(() => g.canActivate(ctx(ProtectedController, "8.8.8.8"))).toThrow(ForbiddenException);
+    });
+
+    it("also applies to @SkipIpAllowlist routes (a banned IP is banned everywhere)", () => {
+      const g = make({ protected: "203.0.113.5", deny: "8.8.8.8" });
+      expect(() => g.canActivate(ctx(WebhookController, "8.8.8.8"))).toThrow(ForbiddenException);
+      expect(g.canActivate(ctx(WebhookController, "1.1.1.1"))).toBe(true);
+    });
+
+    it("never denies loopback implicitly, only when listed", () => {
+      const g = make({ deny: "203.0.113.5" });
+      expect(g.canActivate(ctx(ProtectedController, "127.0.0.1"))).toBe(true);
+      expect(g.canActivate(ctx(ProtectedController, "::1"))).toBe(true);
+      const g2 = make({ deny: "127.0.0.1" });
+      expect(() => g2.canActivate(ctx(ProtectedController, "127.0.0.1"))).toThrow(
+        ForbiddenException,
+      );
+    });
+
+    it("exempts rpc contexts and cannot judge a request without a resolvable IP", () => {
+      const g = make({ deny: "203.0.113.5" });
+      expect(g.canActivate(ctx(ProtectedController, "203.0.113.5", "rpc"))).toBe(true);
+      // deny-only has no allowlist to fail closed on: an unresolvable IP cannot be matched
+      expect(g.canActivate(ctx(ProtectedController, undefined))).toBe(true);
+    });
+
+    it("reports the reason to onBlocked", () => {
+      const seen: [string | undefined, string][] = [];
+      const g = make({
+        protected: "203.0.113.5",
+        deny: "198.51.100.9",
+        onBlocked: (ip, reason) => seen.push([ip, reason]),
+      });
+      expect(() => g.canActivate(ctx(ProtectedController, "198.51.100.9"))).toThrow();
+      expect(() => g.canActivate(ctx(ProtectedController, "8.8.8.8"))).toThrow();
+      expect(seen).toEqual([
+        ["198.51.100.9", "denied"],
+        ["8.8.8.8", "not_allowed"],
+      ]);
+    });
+
+    it("logs a distinct line for denied vs not-allowed requests", () => {
+      const warn = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+      const g = make({ protected: "203.0.113.5", deny: "198.51.100.9" });
+      expect(() => g.canActivate(ctx(ProtectedController, "198.51.100.9"))).toThrow();
+      expect(() => g.canActivate(ctx(ProtectedController, "8.8.8.8"))).toThrow();
+      expect(warn).toHaveBeenNthCalledWith(1, "Blocked request from denylisted IP 198.51.100.9");
+      expect(warn).toHaveBeenNthCalledWith(2, "Blocked request from non-allowlisted IP 8.8.8.8");
+      vi.restoreAllMocks();
+    });
+
+    it("fails at construction on a malformed deny entry, naming the option", () => {
+      expect(() => make({ deny: "banana" })).toThrow(/deny: invalid IP\/CIDR "banana"/);
+    });
+  });
 });

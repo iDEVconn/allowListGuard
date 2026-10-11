@@ -54,4 +54,25 @@ describe("restrictRoutesToAllowlist", () => {
     expect(await status("/api/docs", "203.0.113.5")).toBe(200);
     expect(await status("/api/other", "8.8.8.8")).toBe(200);
   });
+
+  it("denied rejects listed IPs even with no allowlist, and wins over allowed", async () => {
+    async function st(url: string, ip: string, allowed: string | undefined, denied: string) {
+      const app = Fastify();
+      restrictRoutesToAllowlist(
+        app,
+        parseIpAllowlist(allowed),
+        "/api/docs",
+        parseIpAllowlist(denied, "deny", { allowLoopback: false }),
+      );
+      app.get("/api/docs", async () => "docs");
+      app.get("/api/other", async () => "other");
+      const res = await app.inject({ url, remoteAddress: ip });
+      await app.close();
+      return res.statusCode;
+    }
+    expect(await st("/api/docs", "198.51.100.9", undefined, "198.51.100.9")).toBe(403);
+    expect(await st("/api/docs", "8.8.8.8", undefined, "198.51.100.9")).toBe(200);
+    expect(await st("/api/docs", "203.0.113.5", "203.0.113.0/24", "203.0.113.5")).toBe(403);
+    expect(await st("/api/other", "198.51.100.9", undefined, "198.51.100.9")).toBe(200);
+  });
 });
