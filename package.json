@@ -1,6 +1,6 @@
 {
   "name": "@idevconn/allowlist-guard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Global NestJS guard that restricts routes by source IP/CIDR, with separate allowlists for protected and public routes. Works on Fastify and Express.",
   "license": "Apache-2.0",
   "author": "iDEVconn",
