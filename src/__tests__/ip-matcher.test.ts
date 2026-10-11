@@ -29,6 +29,13 @@ describe("parseIpAllowlist", () => {
     expect(m("::1")).toBe(true);
   });
 
+  it("allowLoopback: false drops the implicit loopback entries", () => {
+    const m = parseIpAllowlist("203.0.113.5", "X", { allowLoopback: false })!;
+    expect(m("127.0.0.1")).toBe(false);
+    expect(m("::1")).toBe(false);
+    expect(m("203.0.113.5")).toBe(true);
+  });
+
   it("unwraps IPv4-mapped IPv6 addresses", () => {
     const m = parseIpAllowlist("203.0.113.0/24")!;
     expect(m("::ffff:203.0.113.9")).toBe(true);

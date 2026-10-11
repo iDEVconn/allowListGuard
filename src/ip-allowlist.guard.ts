@@ -7,11 +7,15 @@ import {
   type ExecutionContext,
 } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
+import { isIP } from "node:net";
 import { IP_ALLOWLIST_OPTIONS, type IpAllowlistOptions } from "./options.js";
 import { parseIpAllowlist, type IpMatcher } from "./ip-matcher.js";
 import { SKIP_IP_ALLOWLIST_KEY } from "./skip-ip-allowlist.decorator.js";
 
-const MAX_LOGGED_IPS = 1000;
+// Default log line is rate-limited per IP; the map is bounded by evicting the OLDEST
+// entry, so rotating through many IPs can never switch logging off.
+const LOG_INTERVAL_MS = 60_000;
+const MAX_TRACKED_IPS = 1000;
 
 /**
  * Restricts routes by source IP. Reads `request.ip`, which Express/Fastify
@@ -25,19 +29,24 @@ export class IpAllowlistGuard implements CanActivate {
   private readonly protectedMatcher: IpMatcher | null;
   private readonly publicMatcher: IpMatcher | null;
   private readonly publicKey: string;
-  private readonly loggedIps = new Set<string>();
+  private readonly lastLogged = new Map<string, number>();
 
   constructor(
     @Inject(Reflector) private readonly reflector: Reflector,
     @Inject(IP_ALLOWLIST_OPTIONS) private readonly options: IpAllowlistOptions,
   ) {
-    this.protectedMatcher = parseIpAllowlist(options.protected, "protected");
-    this.publicMatcher = parseIpAllowlist(options.public, "public");
+    const parse = { allowLoopback: options.allowLoopback ?? true };
+    this.protectedMatcher = parseIpAllowlist(options.protected, "protected", parse);
+    this.publicMatcher = parseIpAllowlist(options.public, "public", parse);
     this.publicKey = options.publicMetadataKey ?? "isPublic";
   }
 
   canActivate(ctx: ExecutionContext): boolean {
-    if (ctx.getType() !== "http") return true;
+    // Only microservice (RPC) traffic is exempt: it has no client IP and is internal
+    // transport. Any other context type (graphql, ws, ...) is NOT skipped — it has no
+    // resolvable `req.ip` here, so it is denied when a list is enforced (fail closed).
+    const type = ctx.getType<string>();
+    if (type === "rpc") return true;
     if (!this.protectedMatcher && !this.publicMatcher) return true;
 
     const targets = [ctx.getHandler(), ctx.getClass()];
@@ -47,7 +56,7 @@ export class IpAllowlistGuard implements CanActivate {
     const matcher = isPublic ? this.publicMatcher : this.protectedMatcher;
     if (!matcher) return true;
 
-    const { ip } = ctx.switchToHttp().getRequest<{ ip?: string }>();
+    const ip = type === "http" ? ctx.switchToHttp().getRequest<{ ip?: string }>().ip : undefined;
     if (matcher(ip)) return true;
 
     this.notifyBlocked(ip);
@@ -55,11 +64,21 @@ export class IpAllowlistGuard implements CanActivate {
   }
 
   private notifyBlocked(ip: string | undefined): void {
-    const key = ip ?? "unknown";
-    // One report per distinct IP (bounded) — a scanner must not flood the log.
-    if (this.loggedIps.has(key) || this.loggedIps.size >= MAX_LOGGED_IPS) return;
-    this.loggedIps.add(key);
-    if (this.options.onBlocked) this.options.onBlocked(ip);
-    else this.logger.warn(`Blocked request from non-allowlisted IP ${key}`);
+    this.options.onBlocked?.(ip);
+
+    // Never log attacker-controlled text: only a well-formed IP is echoed.
+    const key = ip && isIP(ip) ? ip : "invalid";
+    const now = Date.now();
+    const last = this.lastLogged.get(key);
+    if (last !== undefined && now - last < LOG_INTERVAL_MS) return;
+    this.lastLogged.delete(key);
+    this.lastLogged.set(key, now);
+    if (this.lastLogged.size > MAX_TRACKED_IPS) {
+      const oldest = this.lastLogged.keys().next().value;
+      if (oldest !== undefined) this.lastLogged.delete(oldest);
+    }
+    if (!this.options.onBlocked) {
+      this.logger.warn(`Blocked request from non-allowlisted IP ${key}`);
+    }
   }
 }

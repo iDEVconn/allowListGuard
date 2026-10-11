@@ -16,6 +16,14 @@ export interface IpAllowlistOptions {
    * key used by the common `@Public()` decorator (`SetMetadata('isPublic', true)`).
    */
   publicMetadataKey?: string;
-  /** Called once per distinct blocked IP (bounded). Defaults to a Nest Logger warning. */
+  /**
+   * Always allow loopback once a list is set. Default `true`. Set `false` if a
+   * reverse proxy runs on the same host and `req.ip` could be its loopback address.
+   */
+  allowLoopback?: boolean;
+  /**
+   * Called on EVERY blocked request (feed your metrics/alerting from here).
+   * The default Nest Logger warning is rate-limited per IP; this hook is not.
+   */
   onBlocked?: (ip: string | undefined) => void;
 }
