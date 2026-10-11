@@ -1,0 +1,100 @@
+name: Release
+
+# Runs on every push to main. The `changesets/action@v1` step decides what
+# to do based on the contents of `.changeset/`:
+#
+#   * If any pending `.md` files exist, it opens / refreshes a "Version
+#     Packages" PR that, when merged, bumps package.json + CHANGELOG.md.
+#   * If the latest push IS that release PR being merged (no pending
+#     changesets left), it runs `npm publish` for any package whose new
+#     version isn't already on the registry.
+#
+# Hardened to match the same pattern as iDEVconn/llm-router:
+#   * Concurrency group prevents two releases racing.
+#   * Deprecated npm config cleared so `npm publish` doesn't trip on a
+#     legacy `always-auth` setting baked into the runner image.
+#   * `npm install -g npm@latest` ensures we have OIDC trusted-publishing
+#     support (npm >= 9.5) regardless of the action's Node bundle.
+#   * `NPM_CONFIG_PROVENANCE=true` emits an npm provenance attestation
+#     for every published version (requires `id-token: write`).
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Clean deprecated npm config
+        run: |
+          npm config delete always-auth --location=user 2>/dev/null || true
+          npm config delete always-auth --location=project 2>/dev/null || true
+          rm -f .npmrc
+
+      - name: Ensure npm has OIDC trusted publishing support
+        run: npm install -g npm@latest
+
+      - name: Create Release PR or publish
+        id: changesets
+        uses: changesets/action@v1
+        with:
+          publish: npx changeset publish
+          version: npx changeset version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"
+
+      # `changeset publish` only creates git tags locally in this checkout —
+      # it never pushes them (confirmed by inspecting a run's logs: no `git
+      # push` appears anywhere after "Created git tags."). Without this step
+      # every published version is on npm with no corresponding GitHub tag
+      # or Release — exactly what happened for v0.5.0, and AGAIN for v0.6.0
+      # even after the first fix attempt: `steps.changesets.outputs.published`
+      # came back falsy despite a real publish succeeding (changesets/action@v1
+      # apparently can't parse @changesets/cli v3's publish output the way it
+      # parsed v2's — the bump to CLI v3 landed in the same release window).
+      # Run this unconditionally instead of trusting that output: `git push
+      # --tags` is a safe no-op when there's nothing new to push.
+      - name: Push any git tags created by changeset publish
+        run: git push origin --tags
+
+      # Neither `changesets/action@v1` nor `changeset publish` ever creates a
+      # GitHub Release — only a local git tag (pushed above). Without this,
+      # every version ships to npm with a tag but no Release page (happened
+      # for v0.5.0, v0.6.0, and v0.7.0 before this step existed). Idempotent:
+      # `gh release view` exits non-zero only when the release is missing, so
+      # a rerun with nothing new to publish is a safe no-op.
+      - name: Create a GitHub Release for the tag on this commit, if missing
+        run: |
+          TAG=$(git describe --tags --abbrev=0 --exact-match 2>/dev/null || true)
+          if [ -n "$TAG" ] && ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
