@@ -42,15 +42,19 @@ export interface FastifyHookHost {
  * Matches on the ROUTE Fastify resolved (`routeOptions.url`), not the raw
  * `req.url`: Fastify percent-decodes the path before routing, so `/api/%64ocs`
  * reaches the docs handler while `req.url.startsWith('/api/docs')` is false.
+ *
+ * `allowed` rejects IPs not on it (pass `null` to skip); `denied` rejects IPs on it.
  */
 export function restrictRoutesToAllowlist(
   instance: FastifyHookHost,
-  allowed: IpMatcher,
+  allowed: IpMatcher | null,
   routePrefix: string,
+  denied: IpMatcher | null = null,
 ): void {
   instance.addHook("onRequest", (req, reply, done) => {
     const route = req.routeOptions?.url ?? "";
-    if (route.startsWith(routePrefix) && !allowed(req.ip)) {
+    const blocked = route.startsWith(routePrefix) && (denied?.(req.ip) || (allowed && !allowed(req.ip)));
+    if (blocked) {
       void reply.code(403).send({ statusCode: 403, message: "ip_not_allowed" });
       return;
     }

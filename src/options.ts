@@ -1,5 +1,8 @@
 export const IP_ALLOWLIST_OPTIONS = Symbol("IP_ALLOWLIST_OPTIONS");
 
+/** Why a request was rejected: on the denylist, or not on the applicable allowlist. */
+export type BlockReason = "denied" | "not_allowed";
+
 export interface IpAllowlistOptions {
   /**
    * Allowlist for protected (non-public) routes: comma-separated string or
@@ -11,6 +14,15 @@ export interface IpAllowlistOptions {
    * below. Unset/blank = not enforced.
    */
   public?: string | readonly string[];
+  /**
+   * Denylist applied to EVERY route (protected and public): comma-separated string
+   * or array of IPs/CIDRs that are always rejected. Takes precedence over the
+   * allowlists, and — unlike them — also applies to `@SkipIpAllowlist()` routes
+   * (a banned address is banned everywhere). Works alone ("everyone except these")
+   * or together with the allowlists. Loopback is never denied implicitly.
+   * Unset/blank = nothing denied.
+   */
+  deny?: string | readonly string[];
   /**
    * Metadata key that marks a route as public. Defaults to `'isPublic'`, the
    * key used by the common `@Public()` decorator (`SetMetadata('isPublic', true)`).
@@ -25,5 +37,5 @@ export interface IpAllowlistOptions {
    * Called on EVERY blocked request (feed your metrics/alerting from here).
    * The default Nest Logger warning is rate-limited per IP; this hook is not.
    */
-  onBlocked?: (ip: string | undefined) => void;
+  onBlocked?: (ip: string | undefined, reason: BlockReason) => void;
 }

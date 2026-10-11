@@ -89,3 +89,27 @@ describe("IpAllowlistModule on Express", () => {
     await app.close();
   });
 });
+
+describe("denylist wiring", () => {
+  @Module({
+    imports: [IpAllowlistModule.forRoot({ deny: "8.8.8.8, 198.51.100.0/24" })],
+    controllers: [AppController],
+  })
+  class DenyOnlyModule {}
+
+  it("blocks listed IPs everywhere and lets everyone else in, on Fastify", async () => {
+    const mod = await Test.createTestingModule({ imports: [DenyOnlyModule] }).compile();
+    const app = mod.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    await app.init();
+    await app.getHttpAdapter().getInstance().ready();
+    const get = (url: string, remoteAddress: string) =>
+      app.inject({ method: "GET", url, remoteAddress }).then((r) => r.statusCode);
+
+    for (const url of ["/private", "/open", "/hook"]) {
+      expect(await get(url, "8.8.8.8")).toBe(403);
+      expect(await get(url, "198.51.100.200")).toBe(403);
+      expect(await get(url, "1.1.1.1")).toBe(200);
+    }
+    await app.close();
+  });
+});

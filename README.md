@@ -1,6 +1,6 @@
 # @idevconn/allowlist-guard
 
-Global NestJS guard that restricts routes by **source IP / CIDR**. Two independent allowlists: one for protected (authenticated) routes, one for public ("open") routes. Works on Fastify and Express. No runtime dependencies (uses `node:net` `BlockList`).
+Global NestJS guard that restricts routes by **source IP / CIDR**. Two independent allowlists (one for protected/authenticated routes, one for public/"open" routes) plus a global **denylist** to block specific addresses. Works on Fastify and Express. No runtime dependencies (uses `node:net` `BlockList`).
 
 > [!IMPORTANT]
 > **What this guard does NOT protect against.**
@@ -11,12 +11,13 @@ Global NestJS guard that restricts routes by **source IP / CIDR**. Two independe
 > - A secret embedded in a front-end bundle (API key, HMAC) is extractable in a minute.
 > - Anyone with a valid login can replay requests from a script.
 >
-> The allowlist only helps when your legitimate clients have **known, stable IPs** (office, VPN, your own servers): a request from anywhere else gets `403`. For an **open** API (any user from the internet) an IP list is the wrong tool — use authentication, per-account rate limits and quotas, CAPTCHA / bot protection at the edge (e.g. Cloudflare Turnstile / Bot Management), and registration controls. Treat this guard as an outer perimeter, not as bot protection.
+> The allowlist only helps when your legitimate clients have **known, stable IPs** (office, VPN, your own servers): a request from anywhere else gets `403`. For an **open** API (any user from the internet) an IP list is the wrong tool — use authentication, per-account rate limits and quotas, CAPTCHA / bot protection at the edge (e.g. Cloudflare Turnstile / Bot Management), and registration controls. The denylist is not a substitute either: banned clients just change address. Treat this guard as an outer perimeter, not as bot protection.
 
 ## Features
 
 - IPv4 + IPv6, single addresses and CIDR ranges; IPv4-mapped IPv6 (`::ffff:1.2.3.4`) is normalised.
-- Separate lists for `protected` and `public` routes. A list that is unset/blank is **not enforced**, so adopting the guard is non-breaking.
+- **Allow** (`protected`, `public`) and **deny** (`deny`) lists: "only these", "everyone except these", or both. Deny always wins.
+- Separate allowlists for `protected` and `public` routes. A list that is unset/blank is **not enforced**, so adopting the guard is non-breaking.
 - Loopback (`127.0.0.0/8`, `::1`) is allowed once a list is set (local dev, health probes) — disable with `allowLoopback: false` (see below).
 - `@SkipIpAllowlist()` exempts a route or controller (e.g. HMAC-signed provider webhooks whose IPs you cannot pin).
 - A malformed entry throws at boot naming the option — a typo never silently becomes "everyone allowed" or "everyone blocked".
@@ -76,9 +77,10 @@ bootstrap();
 | ------------------- | ---------------------------------------------------------------------------------------------------- |
 | `protected`         | Comma-separated string or array of IPs/CIDRs for non-public routes. Unset/blank = not enforced.      |
 | `public`            | Same, for public routes.                                                                             |
+| `deny`              | Denylist for **all** routes: comma-separated string or array of IPs/CIDRs that are always rejected. Wins over the allowlists. Unset/blank = nothing denied. |
 | `publicMetadataKey` | Metadata key marking a route public. Default `'isPublic'` (the common `@Public()` decorator's key).  |
 | `allowLoopback`     | Default `true`. Set `false` if a reverse proxy runs on the same host (see below).                    |
-| `onBlocked`         | `(ip) => void`, called on every blocked request. Default: a rate-limited Nest `Logger.warn`.         |
+| `onBlocked`         | `(ip, reason) => void`, called on every blocked request; `reason` is `"denied"` or `"not_allowed"`. Default: a rate-limited Nest `Logger.warn`. |
 
 **The two lists are independent.** Setting only `protected` leaves `@Public` routes (login, lead capture, ...) open to everyone, and vice versa. Set both if you want the whole surface restricted; exempt individual routes with `@SkipIpAllowlist()`.
 
@@ -131,8 +133,9 @@ async function bootstrap() {
   // Swagger UI is a Fastify route outside Nest's guard pipeline: restrict it too,
   // BEFORE SwaggerModule.setup registers it.
   const allowed = parseIpAllowlist(process.env.API_IP_ALLOWLIST);
-  if (allowed) {
-    restrictRoutesToAllowlist(app.getHttpAdapter().getInstance(), allowed, "/api/docs");
+  const denied = parseIpAllowlist(process.env.API_IP_DENYLIST, "deny", { allowLoopback: false });
+  if (allowed || denied) {
+    restrictRoutesToAllowlist(app.getHttpAdapter().getInstance(), allowed, "/api/docs", denied);
   }
   const document = SwaggerModule.createDocument(app, new DocumentBuilder().build());
   SwaggerModule.setup("api/docs", app, document);
@@ -141,6 +144,58 @@ async function bootstrap() {
 }
 bootstrap();
 ```
+
+### What gets blocked: allow vs deny
+
+| Configured                               | Result                                                                                         |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| nothing                                  | Guard off: everyone is let in (today's behaviour).                                             |
+| `deny` only                              | **Everyone except the listed IPs/CIDRs** ("block these, allow the rest").                      |
+| `protected` and/or `public` only         | **Only the listed IPs**, per route class (the other class stays open).                         |
+| allowlist(s) + `deny`                    | Allowed IPs get in, **except** any that are also denied. Deny always wins.                     |
+
+Order of checks per request: RPC contexts are exempt → **`deny`** (every route, including `@SkipIpAllowlist` ones) → `@SkipIpAllowlist()` → the route's allowlist (`public` for public routes, otherwise `protected`).
+
+### Blocking specific IPs (denylist)
+
+Let everyone in, but reject some addresses:
+
+```ts
+IpAllowlistModule.forRoot({
+  // IPs and CIDRs (IPv4 + IPv6), comma-separated string or array.
+  deny: "203.0.113.5, 198.51.100.0/24, 2001:db8::/32",
+});
+```
+
+Combine with an allowlist — e.g. a whole office range except one compromised host:
+
+```ts
+IpAllowlistModule.forRoot({
+  protected: "10.0.0.0/8",
+  deny: ["10.1.2.3"], // inside the allowed range, still blocked
+});
+```
+
+From the environment:
+
+```ts
+IpAllowlistModule.forRoot({
+  protected: process.env.API_IP_ALLOWLIST,
+  public: process.env.API_PUBLIC_IP_ALLOWLIST,
+  deny: process.env.API_IP_DENYLIST, // "203.0.113.5,198.51.100.0/24"
+});
+```
+
+Notes:
+
+- `deny` applies to **every** route, including ones marked `@SkipIpAllowlist()` (e.g. webhooks): a banned address is banned everywhere. Be careful not to list a range your providers call from.
+- Loopback is **never** denied implicitly (only if you list it). It is also not allowed implicitly by `deny` alone, because without an allowlist everything not denied is allowed anyway.
+- A malformed entry throws at boot (`deny: invalid IP/CIDR "banana"`), so a typo never silently disables the ban.
+- Identify why a request was blocked in `onBlocked((ip, reason) => ...)`: `"denied"` vs `"not_allowed"`. The default log line differs too (`denylisted IP` / `non-allowlisted IP`).
+- Both outcomes return the same `403 ip_not_allowed`.
+- Without an allowlist the guard can only judge requests that carry a client IP (HTTP). Non-HTTP contexts such as GraphQL/WebSocket have no resolvable `req.ip` here, so a deny-only setup cannot ban them (with an allowlist they are denied, fail closed).
+
+**Limits of IP bans.** An address changes with a VPN, proxy or mobile network, and a ban on a shared address (office, carrier NAT) blocks everyone behind it. To stop a specific *person*, suspend their account; use the denylist for abusive addresses, scanners and floods. For permanent, high-volume blocking prefer the edge (nginx `deny`, Cloudflare WAF, firewall), which stops traffic before it reaches your app.
 
 ### Exempting routes
 
@@ -160,7 +215,7 @@ export class WebhooksController {
 }
 ```
 
-`@SkipIpAllowlist()` also works on a whole controller class (e.g. a health check controller).
+`@SkipIpAllowlist()` also works on a whole controller class (e.g. a health check controller). It exempts a route from the **allowlists only**; the `deny` list still applies.
 
 ### Using your own "public" decorator
 
@@ -180,7 +235,8 @@ IpAllowlistModule.forRoot({ public: "198.51.100.0/24", publicMetadataKey: OPEN_R
 ```ts
 IpAllowlistModule.forRoot({
   protected: process.env.API_IP_ALLOWLIST,
-  onBlocked: (ip) => metrics.increment("ip_allowlist.blocked", { ip: ip ?? "unknown" }),
+  onBlocked: (ip, reason) =>
+    metrics.increment("ip_allowlist.blocked", { ip: ip ?? "unknown", reason }), // "denied" | "not_allowed"
 });
 ```
 
@@ -193,11 +249,15 @@ const isAllowed = parseIpAllowlist("203.0.113.5, 10.0.0.0/8", "myList");
 isAllowed?.("10.4.5.6"); // true  (returns null when the list is blank = not enforced)
 isAllowed?.("::ffff:203.0.113.5"); // true  (IPv4-mapped IPv6 is normalised)
 isAllowed?.("8.8.8.8"); // false
+
+// A denylist matcher: no implicit loopback.
+const isBanned = parseIpAllowlist("203.0.113.5", "deny", { allowLoopback: false });
+isBanned?.("203.0.113.5"); // true
 ```
 
 ### Local development and tests
 
-Leave the lists unset: nothing is enforced, so `localhost`, Postman and e2e tests work as usual. With a list set, loopback (`127.0.0.1`, `::1`) is still allowed unless `allowLoopback: false`. In e2e tests either leave the lists unset or set `protected` to a test IP and send requests from it (Fastify `app.inject({ remoteAddress })`; Express with `trust proxy` + `X-Forwarded-For`).
+Leave the lists (`protected`, `public`, `deny`) unset: nothing is enforced, so `localhost`, Postman and e2e tests work as usual. With a list set, loopback (`127.0.0.1`, `::1`) is still allowed unless `allowLoopback: false`. In e2e tests either leave the lists unset or set `protected` to a test IP and send requests from it (Fastify `app.inject({ remoteAddress })`; Express with `trust proxy` + `X-Forwarded-For`).
 
 ## Getting the real client IP (read this)
 
@@ -219,7 +279,7 @@ Without any trust-proxy setting `req.ip` is the proxy's own address for every cl
 
 ## Routes outside Nest (Swagger UI)
 
-Fastify-native routes never reach Nest guards; `restrictRoutesToAllowlist` (see the Fastify example) applies the same list to them. It matches on the resolved route (`routeOptions.url`), not the raw URL, so percent-encoded paths such as `/api/%64ocs` cannot slip past.
+Fastify-native routes never reach Nest guards; `restrictRoutesToAllowlist(instance, allowed, routePrefix, denied?)` (see the Fastify example) applies the same lists to them. Pass `null` as `allowed` to use only a denylist. It matches on the resolved route (`routeOptions.url`), not the raw URL, so percent-encoded paths such as `/api/%64ocs` cannot slip past.
 
 ## Limits
 
