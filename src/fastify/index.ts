@@ -1,4 +1,3 @@
-import type { FastifyInstance } from "fastify";
 import { parseIpAllowlist, type IpMatcher } from "../ip-matcher.js";
 
 /**
@@ -20,6 +19,22 @@ export function buildTrustProxy(
 }
 
 /**
+ * Structural slice of a Fastify instance — deliberately not `FastifyInstance`, so
+ * it type-checks even when the app and `@nestjs/platform-fastify` resolve two
+ * different copies of `fastify`.
+ */
+export interface FastifyHookHost {
+  addHook(
+    name: "onRequest",
+    hook: (
+      req: { ip: string; routeOptions?: { url?: string } },
+      reply: { code(statusCode: number): { send(payload: unknown): unknown } },
+      done: () => void,
+    ) => void,
+  ): unknown;
+}
+
+/**
  * Restricts Fastify-native routes that live outside Nest's guard pipeline
  * (e.g. Swagger UI under `/api/docs`) with the same allowlist. Register BEFORE
  * those routes are added.
@@ -29,7 +44,7 @@ export function buildTrustProxy(
  * reaches the docs handler while `req.url.startsWith('/api/docs')` is false.
  */
 export function restrictRoutesToAllowlist(
-  instance: FastifyInstance,
+  instance: FastifyHookHost,
   allowed: IpMatcher,
   routePrefix: string,
 ): void {
